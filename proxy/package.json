@@ -1,0 +1,12 @@
+{
+  "name": "dev-proxy",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.1.0",
+    "http-proxy-middleware": "^3.0.5"
+  },
+  "scripts": {
+    "start": "node dev-proxy.js"
+  }
+}

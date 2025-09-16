@@ -1,0 +1,636 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:http/http.dart' as http;
+// import 'package:flutter_polyline_points/flutter_polyline_points.dart';
+
+import '../services/dolphin_api.dart';
+import '../services/mqtt_service.dart';
+import '../models/booking.dart';
+
+class BookingScreen extends StatefulWidget {
+  const BookingScreen({super.key});
+  @override
+  State<BookingScreen> createState() => _BookingScreenState();
+}
+
+class _BookingScreenState extends State<BookingScreen> {
+  final _mapCtl = MapController();
+
+  // data
+  List<Area> _areas = [];
+  String? _areaId;
+  List<StationVM> _stations = [];
+  final List<String> _pickedIds = [];
+
+  // map + tracking
+  Marker? _carMarker;
+  final List<LatLng> _carTrail = [];
+  StreamSubscription? _carSub;
+  int _progressIdx = 0;
+  List<LatLng> _osrmRoute = [];
+
+  // ride info
+  Map<String, dynamic>? _rideInfo;
+
+  // ui state
+  bool _loadingAreas = true;
+  bool _loadingStations = false;
+  bool _sending = false;
+  String _stationFilter = '';
+
+  static const _tileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+  static const _subs = ['a', 'b', 'c'];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAreas();
+    MqttService.I.init();
+  }
+
+  @override
+  void dispose() {
+    _carSub?.cancel();
+    super.dispose();
+  }
+
+  // ========= API =========
+
+  Future<void> _loadAreas() async {
+    setState(() => _loadingAreas = true);
+    try {
+      final list = await DolphinApi.I.getMaps();
+      _areas = list.map((e) => Area.fromJson(e)).toList();
+      if (_areas.isNotEmpty) {
+        _areaId ??= _areas.first.id;
+        await _loadStationsForArea(_areaId!);
+        _fitWholeArea();
+      }
+    } catch (e) {
+      _snack('Lỗi tải khu vực: $e');
+    } finally {
+      if (mounted) setState(() => _loadingAreas = false);
+    }
+  }
+
+  Future<void> _loadStationsForArea(String areaId) async {
+    setState(() {
+      _loadingStations = true;
+      _stations = [];
+      _pickedIds.clear();
+      _carMarker = null;
+      _carTrail.clear();
+      _progressIdx = 0;
+      _osrmRoute.clear();
+      _rideInfo = null;
+    });
+    try {
+      final raw = await DolphinApi.I.getAllStationsByMapSafe(areaId);
+      _stations = raw.map((e) => StationVM.fromJson(e)).toList();
+      if (mounted) setState(() {});
+      _fitWholeArea();
+    } catch (e) {
+      _snack('Lỗi tải bến: $e');
+    } finally {
+      if (mounted) setState(() => _loadingStations = false);
+    }
+  }
+
+  Future<List<LatLng>> _fetchRoute(List<LatLng> waypoints) async {
+    if (waypoints.length < 2) return [];
+
+    final coords =
+        waypoints.map((p) => '${p.longitude},${p.latitude}').join(';');
+    final url = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/$coords?geometries=polyline&overview=full');
+
+    final res = await http.get(url);
+    if (res.statusCode != 200) return [];
+
+    final data = json.decode(res.body);
+    if (data['routes'] == null || data['routes'].isEmpty) return [];
+
+    final geometry = data['routes'][0]['geometry'];
+    return decodePolyline(geometry);
+  }
+
+  Future<void> _createRide() async {
+    final picked = _pickedStations;
+    if (picked.length < 2) return _snack('Chọn tối thiểu 2 bến 👋');
+    setState(() => _sending = true);
+    try {
+      final ids = picked.map((e) => e.id).toList();
+      final res = await DolphinApi.I.createRide(
+        stationIds: ids,
+      );
+
+      final carId =
+          (res['carId'] ?? res['vehicleId'] ?? res['assignedVehicle']?['id'])
+              ?.toString();
+
+      _carTrail.clear();
+      _progressIdx = 0;
+      _rideInfo = {
+        'plate': res['vehicle']?['plateNumber'] ??
+            res['plateNumber'] ??
+            res['license'] ??
+            '',
+        'id': res['id'] ?? '',
+      };
+
+      if (carId != null && carId.isNotEmpty) {
+        _startCarTracking(carId);
+        _snack('Đã tạo chuyến • xe: $carId');
+      } else {
+        _snack('Tạo chuyến thành công (chưa gán xe)');
+      }
+
+      _fitRoute();
+    } catch (e) {
+      _snack('Tạo chuyến lỗi: $e');
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  // ========= Tracking =========
+
+  void _startCarTracking(String carId) async {
+    await _carSub?.cancel();
+    _carSub = MqttService.I.telemetryStream(carId).listen((j) {
+      final lat = (j['lat'] as num?)?.toDouble();
+      final lng = (j['lng'] as num?)?.toDouble();
+      final heading = (j['heading'] as num?)?.toDouble() ?? 0;
+      if (lat == null || lng == null) return;
+
+      final pos = LatLng(lat, lng);
+      if (_carTrail.isEmpty || _carTrail.last != pos) _carTrail.add(pos);
+
+      setState(() {
+        _carMarker = Marker(
+          point: pos,
+          width: 40,
+          height: 40,
+          rotate: true,
+          alignment: Alignment.center,
+          child: Transform.rotate(
+            angle: heading * math.pi / 180.0,
+            child:
+                const Icon(Icons.directions_car, size: 32, color: Colors.red),
+          ),
+        );
+        _updateProgress(pos);
+      });
+
+      _mapCtl.move(pos, _mapCtl.camera.zoom);
+    });
+  }
+
+  void _updateProgress(LatLng pos) {
+    final pts = _osrmRoute.isNotEmpty ? _osrmRoute : _plannedPoints;
+    if (pts.length < 2) return;
+
+    var bestIdx = _progressIdx;
+    var bestDist = double.infinity;
+    for (var i = _progressIdx; i < pts.length; i++) {
+      final d = const Distance().as(LengthUnit.Meter, pos, pts[i]);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx > _progressIdx) _progressIdx = bestIdx;
+  }
+
+  // ========= Helpers =========
+
+  List<LatLng> get _plannedPoints => _pickedStations.map((e) => e.pos).toList();
+
+  List<StationVM> get _pickedStations => _pickedIds
+      .map((id) => _stations.firstWhere((s) => s.id == id,
+          orElse: () => _stations.first))
+      .where((s) => s.id.isNotEmpty)
+      .toList();
+
+  void _fitWholeArea() {
+    final area =
+        _areas.firstWhere((a) => a.id == _areaId, orElse: () => _areas.first);
+    final LatLng target = area.center ??
+        (_stations.isNotEmpty
+            ? _stations.first.pos
+            : const LatLng(21.028511, 105.804817));
+    _mapCtl.move(target, 14);
+  }
+
+  void _fitRoute() {
+    final pts = _osrmRoute.isNotEmpty ? _osrmRoute : _plannedPoints;
+    if (pts.isEmpty) return;
+    if (pts.length == 1) {
+      _mapCtl.move(pts.first, 16);
+      return;
+    }
+    var minLat = pts.first.latitude, maxLat = pts.first.latitude;
+    var minLng = pts.first.longitude, maxLng = pts.first.longitude;
+    for (final p in pts) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLng) minLng = p.longitude;
+      if (p.longitude > maxLng) maxLng = p.longitude;
+    }
+    final bounds = LatLngBounds(LatLng(minLat, minLng), LatLng(maxLat, maxLng));
+    _mapCtl.fitCamera(
+      CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(32)),
+    );
+  }
+
+  _togglePick(String id) async {
+    setState(() {
+      if (_pickedIds.contains(id)) {
+        _pickedIds.remove(id);
+      } else {
+        _pickedIds.add(id);
+      }
+      _progressIdx = 0;
+    });
+
+    final pts = _plannedPoints;
+    if (pts.length >= 2) {
+      final osrmRoute = await _fetchRoute(pts);
+      setState(() {
+        _osrmRoute = osrmRoute;
+      });
+      _fitRoute();
+    }
+  }
+
+  void _moveUp(int i) {
+    if (i <= 0) return;
+    setState(() {
+      final id = _pickedIds.removeAt(i);
+      _pickedIds.insert(i - 1, id);
+      _progressIdx = 0;
+    });
+    _fitRoute();
+  }
+
+  void _moveDown(int i) {
+    if (i >= _pickedIds.length - 1) return;
+    setState(() {
+      final id = _pickedIds.removeAt(i);
+      _pickedIds.insert(i + 1, id);
+      _progressIdx = 0;
+    });
+    _fitRoute();
+  }
+
+  void _snack(String msg) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  // ========= Build =========
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    final routePts = _osrmRoute.isNotEmpty ? _osrmRoute : _plannedPoints;
+
+    final done = (routePts.isEmpty)
+        ? const <LatLng>[]
+        : routePts.sublist(0, (_progressIdx + 1).clamp(0, routePts.length));
+    final remain = (routePts.isEmpty)
+        ? const <LatLng>[]
+        : routePts.sublist(_progressIdx.clamp(0, routePts.length - 1));
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Đặt xe (OSM + OSRM)'),
+        actions: [
+          if (_loadingAreas || _loadingStations || _sending)
+            const Padding(
+              padding: EdgeInsets.only(right: 12),
+              child: Center(
+                child: SizedBox.square(
+                    dimension: 18, child: CircularProgressIndicator()),
+              ),
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // chọn khu vực
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+            child: DropdownButtonFormField<String>(
+              decoration: const InputDecoration(
+                labelText: 'Chọn khu vực',
+                border: OutlineInputBorder(),
+                contentPadding:
+                    EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              ),
+              value: _areaId,
+              items: _areas
+                  .map(
+                      (a) => DropdownMenuItem(value: a.id, child: Text(a.name)))
+                  .toList(),
+              onChanged: (v) async {
+                if (v == null) return;
+                setState(() => _areaId = v);
+                await _loadStationsForArea(v);
+              },
+            ),
+          ),
+
+          Expanded(
+            child: Row(
+              children: [
+                // Sidebar
+                SizedBox(
+                  width: 300,
+                  child: Column(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+                        child: TextField(
+                          decoration: const InputDecoration(
+                            prefixIcon: Icon(Icons.search),
+                            hintText: 'Tìm bến...',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          onChanged: (v) =>
+                              setState(() => _stationFilter = v.trim()),
+                        ),
+                      ),
+                      Expanded(child: _buildStationList()),
+                    ],
+                  ),
+                ),
+                // Map
+                Expanded(
+                  child: FlutterMap(
+                    mapController: _mapCtl,
+                    options: const MapOptions(
+                      initialCenter: LatLng(21.028511, 105.804817),
+                      initialZoom: 13,
+                    ),
+                    children: [
+                      TileLayer(
+                        urlTemplate: _tileUrl,
+                        subdomains: _subs,
+                        userAgentPackageName: 'com.example.dolphin',
+                      ),
+                      if (_carTrail.length >= 2)
+                        PolylineLayer(polylines: [
+                          Polyline(
+                            points: _carTrail,
+                            color: Colors.purple.withOpacity(.5),
+                            strokeWidth: 3,
+                          )
+                        ]),
+                      if (done.length >= 2)
+                        PolylineLayer(polylines: [
+                          Polyline(
+                            points: done,
+                            color: Colors.grey.shade600,
+                            strokeWidth: 5,
+                          )
+                        ]),
+                      if (remain.length >= 2)
+                        PolylineLayer(polylines: [
+                          Polyline(
+                            points: remain,
+                            color: Colors.blueAccent,
+                            strokeWidth: 5,
+                          )
+                        ]),
+                      MarkerLayer(markers: [
+                        for (int i = 0; i < _pickedStations.length; i++)
+                          Marker(
+                            point: _pickedStations[i].pos,
+                            width: 36,
+                            height: 36,
+                            child: _numberPin(i + 1),
+                          ),
+                        if (_carMarker != null) _carMarker!,
+                      ]),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // bottom info
+          if (_rideInfo != null)
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                border: Border(top: BorderSide(color: Colors.grey.shade300)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Xe: ${_rideInfo!['plate'] ?? 'Đang chờ'}',
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  for (int i = 0; i < _pickedStations.length; i++) ...[
+                    Text('${i + 1}. ${_pickedStations[i].title}'),
+                    if (i < _pickedStations.length - 1)
+                      Text('↳ ${(Distance().as(
+                        LengthUnit.Kilometer,
+                        _pickedStations[i].pos,
+                        _pickedStations[i + 1].pos,
+                      )).toStringAsFixed(2)} km'),
+                  ],
+                ],
+              ),
+            ),
+
+          // actions
+          Container(
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              border: Border(top: BorderSide(color: theme.dividerColor)),
+            ),
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _pickedStations.isEmpty
+                      ? const Text('Chọn bến ở cột bên trái để lập lộ trình')
+                      : SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              for (int i = 0; i < _pickedStations.length; i++)
+                                _StopChip(
+                                  index: i + 1,
+                                  title: _pickedStations[i].title,
+                                ),
+                            ],
+                          ),
+                        ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: _sending || _pickedStations.length < 2
+                      ? null
+                      : _createRide,
+                  icon: const Icon(Icons.send_rounded),
+                  label: const Text('Tạo chuyến'),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStationList() {
+    final s = _stationFilter.toLowerCase();
+    final filtered = s.isEmpty
+        ? _stations
+        : _stations.where((x) => (x.title.toLowerCase()).contains(s)).toList();
+
+    return ListView.builder(
+      itemCount: filtered.length,
+      itemBuilder: (context, i) {
+        final st = filtered[i];
+        final picked = _pickedIds.contains(st.id);
+        final order = picked ? _pickedIds.indexOf(st.id) + 1 : null;
+
+        return ListTile(
+          dense: true,
+          leading: Checkbox(
+            value: picked,
+            onChanged: (_) => _togglePick(st.id),
+          ),
+          title: Text(st.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+            '(${st.pos.latitude.toStringAsFixed(6)}, ${st.pos.longitude.toStringAsFixed(6)})',
+            style: const TextStyle(fontSize: 11),
+          ),
+          trailing: SizedBox(
+            width: 96,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (order != null)
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    margin: const EdgeInsets.only(right: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.shade600,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text('$order',
+                        style: const TextStyle(color: Colors.white)),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.arrow_upward),
+                  tooltip: 'Lên',
+                  onPressed: order == null ? null : () => _moveUp(order - 1),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.arrow_downward),
+                  tooltip: 'Xuống',
+                  onPressed: order == null ? null : () => _moveDown(order - 1),
+                ),
+              ],
+            ),
+          ),
+          onTap: () => _togglePick(st.id),
+        );
+      },
+    );
+  }
+
+  Widget _numberPin(int n) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        const Icon(Icons.location_on, size: 36, color: Colors.blue),
+        Positioned(
+          top: 10,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              '$n',
+              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StopChip extends StatelessWidget {
+  final int index;
+  final String title;
+  const _StopChip({required this.index, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(right: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.orange.shade600,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+              radius: 10,
+              child: Text('$index', style: const TextStyle(fontSize: 12))),
+          const SizedBox(width: 6),
+          Text(title, style: const TextStyle(color: Colors.white)),
+        ],
+      ),
+    );
+  }
+}
+
+// Decode polyline (Google/OSRM encoded string) thành List<LatLng>
+List<LatLng> decodePolyline(String polyline) {
+  List<LatLng> points = [];
+  int index = 0, len = polyline.length;
+  int lat = 0, lng = 0;
+
+  while (index < len) {
+    int b, shift = 0, result = 0;
+    do {
+      b = polyline.codeUnitAt(index++) - 63;
+      result |= (b & 0x1F) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    int dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+    lat += dlat;
+
+    shift = 0;
+    result = 0;
+    do {
+      b = polyline.codeUnitAt(index++) - 63;
+      result |= (b & 0x1F) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    int dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+    lng += dlng;
+
+    points.add(LatLng(lat / 1E5, lng / 1E5));
+  }
+
+  return points;
+}
