@@ -1,23 +1,26 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart'; // ⬅️ THÊM DÒNG NÀY
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
 import 'theme/app_theme.dart';
-import 'core/router.dart';
+import 'data/api.dart';
+import 'features/auth/login_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: 'assets/config.env'); // ⬅️ Nạp env
-  runApp(const RoboRideApp());
+  await dotenv.load(fileName: "assets/config.env");
+  runApp(const PheniCarApp());
 }
 
-class RoboRideApp extends StatelessWidget {
-  const RoboRideApp({super.key});
+class PheniCarApp extends StatelessWidget {
+  const PheniCarApp({super.key});
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp.router(
-      title: 'RoboRide',
-      theme: buildAppTheme(),
+    return MaterialApp(
+      title: 'PheniCar',
+      theme: AppTheme.lightTheme,
       debugShowCheckedModeBanner: false,
-      routerConfig: appRouter,
+      home: LoginPage(api: Api()), // <-- BẮT ĐẦU từ Login
     );
   }
 }

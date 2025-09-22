@@ -1,35 +1,33 @@
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class Env {
-  static String get workerBase => (dotenv.maybeGet('WORKER_BASE') ??
-          const String.fromEnvironment('WORKER_BASE', defaultValue: ''))
-      .replaceFirst(RegExp(r'/*$'), '');
+  // chuẩn hoá: bỏ dấu '/' cuối nếu có
+  static String _trimSlash(String s) => s.replaceFirst(RegExp(r'/*$'), '');
 
-  static String get dapiBase => (dotenv.maybeGet('DAPI_BASE') ??
-          const String.fromEnvironment('DAPI_BASE', defaultValue: ''))
-      .replaceFirst(RegExp(r'/*$'), '');
+  /// Worker Node (simulator)
+  static String get workerBase => _trimSlash(
+        dotenv.env['WORKER_BASE'] ?? 'http://localhost:3002',
+      );
 
-  static String get osrmBase => (dotenv.maybeGet('OSRM_BASE') ??
-          const String.fromEnvironment('OSRM_BASE',
-              defaultValue: 'https://router.project-osrm.org/route/v1/driving'))
-      .replaceFirst(RegExp(r'/*$'), '');
+  /// Dolphin API base (nên là .../api hoặc .../api/v1 tuỳ bạn set)
+  /// Ví dụ của bạn: http://116.118.95.187:3000/api
+  static String get dapiBase => _trimSlash(
+        dotenv.env['DAPI_BASE'] ?? 'http://localhost:3000/api',
+      );
 
+  /// OSRM
+  static String get osrmBase => _trimSlash(
+        dotenv.env['OSRM_BASE'] ??
+            'https://router.project-osrm.org/route/v1/driving',
+      );
+
+  /// MQTT WS
   static String get mqttWs =>
-      dotenv.maybeGet('MQTT_WS') ??
-      const String.fromEnvironment('MQTT_WS', defaultValue: '');
+      dotenv.env['MQTT_WS'] ?? 'ws://localhost:8083/mqtt';
+  static String get mqttUsername => dotenv.env['MQTT_USERNAME'] ?? '';
+  static String get mqttPassword => dotenv.env['MQTT_PASSWORD'] ?? '';
 
-  static String get mqttUser =>
-      dotenv.maybeGet('MQTT_USERNAME') ??
-      const String.fromEnvironment('MQTT_USERNAME', defaultValue: '');
-
-  static String get mqttPass =>
-      dotenv.maybeGet('MQTT_PASSWORD') ??
-      const String.fromEnvironment('MQTT_PASSWORD', defaultValue: '');
-
-  static Duration get routeTimeout {
-    final s = dotenv.maybeGet('ROUTE_TIMEOUT_MS') ??
-        const String.fromEnvironment('ROUTE_TIMEOUT_MS', defaultValue: '7000');
-    final ms = int.tryParse(s) ?? 7000;
-    return Duration(milliseconds: ms);
-  }
+  /// Routing timeout
+  static int get routeTimeoutMs =>
+      int.tryParse(dotenv.env['ROUTE_TIMEOUT_MS'] ?? '') ?? 7000;
 }
