@@ -1,18 +1,21 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-
 import 'theme/app_theme.dart';
 import 'data/api.dart';
 import 'features/auth/login_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: "assets/config.env");
-  runApp(const PheniCarApp());
+
+  final api = Api();
+  // dùng service mới
+  api.mqtt.connect(onStatus: (s) => debugPrint("MQTT: $s"));
+
+  runApp(PheniCarApp(api: api));
 }
 
 class PheniCarApp extends StatelessWidget {
-  const PheniCarApp({super.key});
+  final Api api;
+  const PheniCarApp({super.key, required this.api});
 
   @override
   Widget build(BuildContext context) {
@@ -20,7 +23,7 @@ class PheniCarApp extends StatelessWidget {
       title: 'PheniCar',
       theme: AppTheme.lightTheme,
       debugShowCheckedModeBanner: false,
-      home: LoginPage(api: Api()), // <-- BẮT ĐẦU từ Login
+      home: LoginPage(api: api),
     );
   }
 }

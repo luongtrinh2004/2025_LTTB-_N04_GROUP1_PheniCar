@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
-import '../../data/api.dart';
-import '../../data/models.dart';
+import 'package:mobile/data/api.dart';
+import 'package:mobile/data/models.dart';
 
 class BookingPage extends StatefulWidget {
   final Api api;
@@ -42,27 +42,30 @@ class _BookingPageState extends State<BookingPage> {
     super.initState();
     _loadAreas();
 
-    // MQTT realtime: lắng nghe car/+/telemetry
-    widget.api.connectMqtt(onStatus: (s) => debugPrint('MQTT: $s'));
-    _teleSub = widget.api.telemetryStream.listen((t) {
-      // chỉ cập nhật nếu xe này đang theo dõi
-      if (_vehicles.containsKey(t.carId)) {
-        final old = _vehicles[t.carId]!;
-        setState(() {
-          _vehicles[t.carId] = Vehicle(
-            id: old.id,
-            mapId: old.mapId,
-            lat: t.lat,
-            lng: t.lng,
-            online: old.online,
-            status: t.status,
-            speed: t.speed,
-            charge: old.charge,
-            updatedAt: t.ts,
-          );
-        });
-        _updateFooterFromNearest();
-      }
+    // ✅ Kết nối MQTT qua service: api.mqtt
+    Future.microtask(() async {
+      await widget.api.mqtt.connect(onStatus: (s) => debugPrint('MQTT: $s'));
+
+      _teleSub = widget.api.mqtt.telemetryStream.listen((t) {
+        // chỉ cập nhật nếu xe này đang theo dõi
+        if (_vehicles.containsKey(t.carId ?? '')) {
+          final old = _vehicles[t.carId]!;
+          setState(() {
+            _vehicles[t.carId!] = Vehicle(
+              id: old.id,
+              mapId: old.mapId,
+              lat: t.lat ?? old.lat,
+              lng: t.lng ?? old.lng,
+              online: old.online,
+              status: t.status ?? old.status,
+              speed: t.speed ?? old.speed,
+              charge: old.charge,
+              updatedAt: t.ts ?? old.updatedAt,
+            );
+          });
+          _updateFooterFromNearest();
+        }
+      }, onError: (e) => debugPrint('telemetry error: $e'));
     });
   }
 
@@ -83,8 +86,8 @@ class _BookingPageState extends State<BookingPage> {
     double best = 1e18;
     Vehicle? out;
     for (final v in _vehicles.values) {
-      final dlat = v.lat - p.latitude;
-      final dlng = v.lng - p.longitude;
+      final dlat = (v.lat ?? 0) - p.latitude;
+      final dlng = (v.lng ?? 0) - p.longitude;
       final d = dlat * dlat + dlng * dlng;
       if (d < best) {
         best = d;
@@ -99,7 +102,7 @@ class _BookingPageState extends State<BookingPage> {
     final near = _nearestVehicleTo(_areaCenter!);
     if (near == null) return;
     setState(() {
-      _plate = near.id;
+      _plate = near.id ?? '--';
       _speed = near.speed ?? 0;
     });
   }
@@ -141,7 +144,7 @@ class _BookingPageState extends State<BookingPage> {
       setState(() {
         _vehicles
           ..clear()
-          ..addEntries(filtered.map((v) => MapEntry(v.id, v)));
+          ..addEntries(filtered.map((v) => MapEntry(v.id ?? '', v)));
       });
       _updateFooterFromNearest();
     } catch (e) {
@@ -166,7 +169,7 @@ class _BookingPageState extends State<BookingPage> {
             final it = _areas[i];
             final picked = _pickedArea?.id == it.id;
             return ListTile(
-              title: Text(it.name),
+              title: Text(it.name ?? '(no name)'),
               trailing:
                   picked ? const Icon(Icons.check, color: Colors.green) : null,
               onTap: () => Navigator.pop(ctx, it),
@@ -187,14 +190,16 @@ class _BookingPageState extends State<BookingPage> {
       _areaCenter = null;
     });
 
-    await _loadStations(a.id);
-    await _loadVehiclesForArea(a.id);
+    if (a.id != null && a.id!.isNotEmpty) {
+      await _loadStations(a.id!);
+      await _loadVehiclesForArea(a.id!);
+    }
   }
 
   void _zoomToStations(List<Station> st) {
     if (st.isEmpty) return;
-    final lat = st.map((e) => e.lat).reduce((a, b) => a + b) / st.length;
-    final lng = st.map((e) => e.lng).reduce((a, b) => a + b) / st.length;
+    final lat = st.map((e) => e.lat ?? 0).reduce((a, b) => a + b) / st.length;
+    final lng = st.map((e) => e.lng ?? 0).reduce((a, b) => a + b) / st.length;
     _areaCenter = ll.LatLng(lat, lng);
     _mapCtrl.move(_areaCenter!, 13);
     setState(() => _mapZoom = 13);
@@ -208,7 +213,7 @@ class _BookingPageState extends State<BookingPage> {
       return;
     }
     if (_allStations.isEmpty) {
-      await _loadStations(_pickedArea!.id);
+      await _loadStations(_pickedArea!.id ?? '');
       if (!mounted) return;
     }
 
@@ -249,18 +254,19 @@ class _BookingPageState extends State<BookingPage> {
                     itemCount: _allStations.length,
                     itemBuilder: (_, i) {
                       final s = _allStations[i];
-                      final checked = selected.contains(s.id);
+                      final id = s.id ?? '';
+                      final checked = selected.contains(id);
                       return CheckboxListTile(
-                        title: Text(s.name),
+                        title: Text(s.name ?? '(no name)'),
                         subtitle: Text(
-                          '(${s.lat.toStringAsFixed(6)}, ${s.lng.toStringAsFixed(6)})',
+                          '(${(s.lat ?? 0).toStringAsFixed(6)}, ${(s.lng ?? 0).toStringAsFixed(6)})',
                         ),
                         value: checked,
                         onChanged: (v) {
                           if (v == true) {
-                            selected.add(s.id);
+                            selected.add(id);
                           } else {
-                            selected.remove(s.id);
+                            selected.remove(id);
                           }
                           setSheet(() {});
                         },
@@ -371,11 +377,11 @@ class _BookingPageState extends State<BookingPage> {
                   MarkerLayer(
                     markers: _allStations
                         .map((s) => Marker(
-                              point: ll.LatLng(s.lat, s.lng),
+                              point: ll.LatLng(s.lat ?? 0, s.lng ?? 0),
                               width: 36,
                               height: 36,
                               child: Tooltip(
-                                message: s.name,
+                                message: s.name ?? '',
                                 child: Icon(
                                   Icons.location_on,
                                   color: _pickedStationIds.contains(s.id)
@@ -389,10 +395,11 @@ class _BookingPageState extends State<BookingPage> {
                   // Xe (snapshot + realtime)
                   MarkerLayer(
                     markers: _vehicles.values.map((v) {
-                      final point = ll.LatLng(v.lat, v.lng);
-                      final color = v.online ? Colors.blue : Colors.grey;
+                      final point = ll.LatLng(v.lat ?? 0, v.lng ?? 0);
+                      final color =
+                          (v.online ?? false) ? Colors.blue : Colors.grey;
                       final info =
-                          '${v.id} • ${(v.speed ?? 0).toStringAsFixed(0)} km/h'
+                          '${v.id ?? ''} • ${(v.speed ?? 0).toStringAsFixed(0)} km/h'
                           '${v.charge != null ? ' • ${v.charge!.toStringAsFixed(0)}%' : ''}';
                       return Marker(
                         point: point,
